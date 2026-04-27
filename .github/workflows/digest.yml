@@ -1,0 +1,28 @@
+﻿name: Digest (weekly summary)
+
+on:
+  schedule:
+    - cron: "0 14 * * 0"
+  workflow_dispatch:
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      SHEET_ID: ${{ secrets.SHEET_ID }}
+      SHEET_TAB: ${{ secrets.SHEET_TAB }}
+      GOOGLE_SA_JSON_PATH: ./google-sa.json
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Restore service account JSON
+        env:
+          GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
+        run: python -c "import os; open('google-sa.json','w').write(os.environ['GOOGLE_SA_JSON'])"
+      - run: python src/digest.py
