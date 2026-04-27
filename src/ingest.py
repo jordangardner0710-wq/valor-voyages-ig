@@ -1,10 +1,13 @@
 ﻿"""
 Ingest: list files in Dropbox /Instagram Automation/raw, append new ones to the Sheet
 as status=pending_metadata. Idempotent - matching by file_path (lowercase).
+
+Reverse-geocodes GPS coords via OpenStreetMap Nominatim (free, no key).
 """
 
 import os
 import io
+import time
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 
@@ -14,6 +17,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 from PIL import Image
 import piexif
+import requests
 
 load_dotenv()
 
@@ -111,6 +115,43 @@ def extract_exif(image_bytes):
     return date_taken, gps_lat, gps_lon
 
 
+def reverse_geocode(lat, lon):
+    """Convert lat/lon to a human-readable place name via OpenStreetMap Nominatim."""
+    if not lat or not lon:
+        return ""
+    try:
+        time.sleep(1.1)  # Nominatim rate limit: max 1 req/sec
+        r = requests.get(
+            "https://nominatim.openstreetmap.org/reverse",
+            params={"format": "json", "lat": lat, "lon": lon,
+                    "zoom": 14, "addressdetails": 1},
+            headers={"User-Agent": "valor-voyages-ig/1.0 (jordangardner0710@gmail.com)"},
+            timeout=15,
+        )
+        if r.status_code != 200:
+            return ""
+        data = r.json()
+        addr = data.get("address", {})
+        parts = []
+        for key in ("attraction", "tourism", "leisure", "natural", "park",
+                    "neighbourhood", "suburb", "village", "town", "city"):
+            if key in addr and addr[key] not in parts:
+                parts.append(addr[key])
+                break
+        for key in ("state", "region", "state_district"):
+            if key in addr and addr[key] not in parts:
+                parts.append(addr[key])
+                break
+        if "country" in addr:
+            parts.append(addr["country"])
+        if parts:
+            return ", ".join(parts)
+        return (data.get("display_name") or "")[:120]
+    except Exception as e:
+        print(f"    [warn] reverse geocode failed: {e}")
+        return ""
+
+
 def compute_group_id(date_taken):
     if not date_taken:
         return ""
@@ -151,6 +192,11 @@ def main():
                 date_taken, gps_lat, gps_lon = "", "", ""
         else:
             date_taken, gps_lat, gps_lon = "", "", ""
+
+        location_text = reverse_geocode(gps_lat, gps_lon)
+        if location_text:
+            print(f"    location: {location_text}")
+
         row = {
             "file_name": photo.name,
             "file_link": link,
@@ -165,7 +211,7 @@ def main():
             "date_taken": date_taken,
             "gps_lat": gps_lat,
             "gps_lon": gps_lon,
-            "location_text": "",
+            "location_text": location_text,
             "file_path": photo.path_lower,
             "post_id": "",
         }
