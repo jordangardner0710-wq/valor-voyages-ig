@@ -2,7 +2,7 @@
 
 on:
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "0 */6 * * *"
   workflow_dispatch:
 
 concurrency:
@@ -23,6 +23,8 @@ jobs:
       GOOGLE_SA_JSON_PATH: ./google-sa.json
     steps:
       - uses: actions/checkout@v4
+      - name: Install exiftool
+        run: sudo apt-get update && sudo apt-get install -y libimage-exiftool-perl
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"

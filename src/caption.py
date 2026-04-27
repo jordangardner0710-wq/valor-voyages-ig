@@ -1,11 +1,13 @@
 ﻿"""
-Caption: pull rows where status=pending_metadata, generate caption + hashtags
-via OpenAI vision, write back, transition status to "ready".
+Caption: pull rows where status=pending_metadata, group by group_id, generate ONE
+caption per group via OpenAI vision (sees up to 3 representative images), apply
+to all rows in the group. Transition status to "ready".
 """
 
 import os
 import json
 import base64
+from collections import defaultdict
 from dotenv import load_dotenv
 
 import dropbox
@@ -20,63 +22,72 @@ SHEET_ID = os.getenv("SHEET_ID")
 SHEET_TAB = os.getenv("SHEET_TAB")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
 
-SYSTEM_PROMPT = """You are writing one Instagram caption for a real family travel/lifestyle post for Valor Voyages.
+SYSTEM_PROMPT = """You are writing one Instagram caption for Valor Voyages, a full-time RV family traveling the US.
 
 Family context:
-- Jordan (29), Kayla (28), Jemma (9)
-- Young adults traveling the US with their daughter Jemma
-- Only mention family members if they are actually visible in the image or clearly relevant
+- Jordan (29, dad) - usually the one taking photos
+- Kayla (28, mom)
+- Jemma (9, daughter)
+- Full-time RVers in their Alliance fifth-wheel pulled by an F350
+- Casual, conversational, real-life update voice
 
-VOICE ANCHOR - captions should sound like these examples:
+VOICE - captions sound like THIS (real prior posts):
 
 Example 1:
-"The kind of sunset that slows everything down. December evenings have this quiet golden weight to them."
+"Seal Rock, Oregon. Wind finally died down enough to take out the drone!"
 
 Example 2:
-"Cold rain, warmer thermos. We didn't say much on this stretch - there wasn't much to say."
+"SkyTrail through giant Redwood and Sequoias!"
 
 Example 3:
-"Three hours into a four-hour drive and Jemma started naming the clouds."
+"Cannon Beach, Oregon. Tide was way out this morning, walked all the way to the rocks."
 
 Example 4:
-"Found this overlook on accident. The kind of detour you don't regret."
+"Okay! We got busy and forgot to post for a while! But quick update - we hooked up and left sunny Arizona to head to the rainy and humid Redwood Forest!"
 
-Notice: specific sensory detail, conversational rhythm, no abstract emotion-words, no clichés, no exclamation points, no rhetorical questions.
+Notice: short, casual, location often opens, exclamation points OK, conversational, NOT poetic.
 
-Priority order:
-1. Analyze what is actually visible in the image
-2. Use location/GPS metadata to ground the place
-3. Use date/time to anchor season or time of day
-4. Use family context only if it genuinely fits
+LOCATION (CRITICAL):
+- If location is provided, you MUST mention it in the caption.
+- Preferred opener: "Place, State." then the observation.
+- The provided location is authoritative.
+- If location is missing, do NOT name a place.
 
-Hard rules:
-- Caption the actual subject. No invented people, activities, or conversations.
-- Mention Jemma only if she is visible or clearly involved.
-- 2 to 4 sentences. Never just one short generic line.
-- First sentence must be specific and grounded - a real observation, not a summary.
-- Show details, don't summarize emotions.
-- Modern, grounded, human. Write like a person texting a friend, not a travel blog.
+PEOPLE IN THE PHOTOS (CRITICAL):
+- You will see 1-3 representative photos from a carousel post (the post may contain more).
+- Carefully look at the photos. Count how many people you see across the images.
+- 1 person who looks like a woman = likely Kayla
+- 1 person who looks like a child = likely Jemma
+- woman + child together = Kayla and Jemma
+- 2 adults + a child = all three
+- ONLY name people clearly visible in the photos. NEVER infer from footprints, shadows, or implied presence.
+- If no people visible in any of the photos: describe the scene/location, no family names.
 
-BANNED phrases (these are AI tells - never use any of them):
-- "vibes" of any kind ("coastal vibes", "good vibes", "summer vibes")
+GENERAL RULES:
+- 1 to 3 sentences. Short is good. Do NOT pad.
+- Casual update voice. Not poetry.
+- "We" first-person plural is the default.
+- 0-2 exclamation points; use sparingly.
+- The caption must describe SOMETHING SPECIFIC, not generic emotion.
+
+BANNED phrases (AI tells - never use):
+- "vibes" of any kind
 - "soaking in", "soaking up", "taking in", "drinking in"
 - "wanderlust", "happy place", "living my best life"
 - "adventure awaits", "making memories", "memories forever"
-- "one city at a time", "the world is your oyster"
-- "what a beautiful day", "feeling blessed", "feeling grateful"
 - "moments like these"
-- "where laughter dances with"
-- Any single-sentence summary caption.
-
-Location rules:
-- Provided location_text/GPS is authoritative.
-- Do NOT name a coast, beach, ocean, city, or landmark unless image or location data clearly supports it.
-- If location is broad, stay broad. If location is missing, do NOT name a specific place.
+- "love these walks/days/moments"
+- "what a beautiful day", "feeling blessed", "feeling grateful"
+- "footprints in the sand", "wide open skies"
+- ANY abstract emotion summary instead of a concrete observation
 
 Hashtags:
-- 8 to 12 hashtags total
-- Mix: location-specific, content-specific, family-travel niche
-- Lowercase: #pnw not #PNW. #familytravel not #FamilyTravel.
+- 5 to 10 hashtags total
+- Lowercase, no spaces, no camelCase
+- ALWAYS include: #rvlife AND #fulltimerv
+- If location provided: 1-2 location-specific tags
+- When relevant: #alliance #f350
+- Subject/activity tags as relevant
 
 Respond ONLY with JSON in this exact format:
 {
@@ -106,13 +117,15 @@ def get_sheets_worksheet():
     return gc.open_by_key(SHEET_ID).worksheet(SHEET_TAB)
 
 
-def fetch_pending(ws):
+def fetch_pending_grouped(ws):
+    """Return dict: group_id -> list of (row_index, row_dict) for all pending rows."""
     records = ws.get_all_records()
-    pending = []
+    groups = defaultdict(list)
     for i, row in enumerate(records, start=2):
         if (row.get("status") or "").strip() == "pending_metadata":
-            pending.append((i, row))
-    return pending
+            gid = (row.get("group_id") or "").strip() or f"_solo_{i}"
+            groups[gid].append((i, row))
+    return dict(groups)
 
 
 def download_image(dbx, path):
@@ -120,53 +133,57 @@ def download_image(dbx, path):
     return response.content
 
 
-def caption_image(client, image_bytes, context):
-    image_b64 = base64.b64encode(image_bytes).decode()
+def caption_group(client, image_bytes_list, context, total_count):
+    """Generate one caption for a group of photos. Sends up to 3 representative images."""
+    image_blocks = []
+    for img_bytes in image_bytes_list[:3]:
+        b64 = base64.b64encode(img_bytes).decode()
+        image_blocks.append({
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:image/jpeg;base64,{b64}",
+                "detail": "high",
+            },
+        })
 
     parts = ["Photo metadata:"]
     if context.get("date_taken"):
         parts.append(f"- Taken: {context['date_taken']}")
     if context.get("location_text"):
-        parts.append(f"- Location: {context['location_text']}")
+        parts.append(f"- Location: {context['location_text']}  (YOU MUST mention this in the caption)")
     elif context.get("gps_lat") and context.get("gps_lon"):
         parts.append(f"- GPS: {context['gps_lat']}, {context['gps_lon']}")
     else:
-        parts.append("- Location: unknown (do NOT name a specific place in the caption or hashtags)")
+        parts.append("- Location: UNKNOWN - do NOT name a specific place")
     parts.append("")
-    parts.append("Write the caption + hashtags following all the rules. Match the voice anchor examples.")
+    if total_count > 1:
+        parts.append(f"This is a CAROUSEL post of {total_count} photos. You see up to 3 representative images. Generate ONE caption for the whole post.")
+    parts.append("Look carefully at the photos, count people, identify family members visible, then write the caption + hashtags.")
     user_text = "\n".join(parts)
+
+    content = [{"type": "text", "text": user_text}] + image_blocks
 
     response = client.chat.completions.create(
         model=OPENAI_MODEL,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": user_text},
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/jpeg;base64,{image_b64}",
-                            "detail": "high",
-                        },
-                    },
-                ],
-            },
+            {"role": "user", "content": content},
         ],
         response_format={"type": "json_object"},
-        max_tokens=500,
+        max_tokens=400,
         temperature=0.7,
     )
     data = json.loads(response.choices[0].message.content)
     return data, response.usage
 
 
-def update_row(ws, row_index, caption, hashtags):
-    ws.update(
-        range_name=f"D{row_index}:F{row_index}",
-        values=[[caption, hashtags, "ready"]],
-    )
+def update_group(ws, row_indices, caption, hashtags):
+    """Apply same caption + hashtags + status=ready to all rows in a group."""
+    for row_idx in row_indices:
+        ws.update(
+            range_name=f"D{row_idx}:F{row_idx}",
+            values=[[caption, hashtags, "ready"]],
+        )
 
 
 def main():
@@ -176,24 +193,32 @@ def main():
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     print(f"Model: {OPENAI_MODEL}")
 
-    pending = fetch_pending(ws)
-    print(f"Pending rows: {len(pending)}")
-    if not pending:
+    groups = fetch_pending_grouped(ws)
+    total_rows = sum(len(rows) for rows in groups.values())
+    print(f"Pending: {total_rows} rows in {len(groups)} group(s)")
+    if not groups:
         return
 
     total_in = total_out = 0
-    for i, (row_idx, row) in enumerate(pending, 1):
-        path = row.get("file_path", "")
-        print(f"  [{i}/{len(pending)}] row {row_idx}: {row.get('file_name')}")
+    for gid, rows in groups.items():
+        first_row = rows[0][1]
+        row_indices = [r[0] for r in rows]
+        print(f"\nGroup {gid}: {len(rows)} photo(s)")
 
-        try:
-            image_bytes = download_image(dbx, path)
-        except Exception as e:
-            print(f"    [error] download failed: {e}")
+        # Download up to 3 representative photos
+        images = []
+        for row_idx, row in rows[:3]:
+            try:
+                images.append(download_image(dbx, row.get("file_path", "")))
+            except Exception as e:
+                print(f"    [warn] download {row.get('file_name')} failed: {e}")
+
+        if not images:
+            print(f"    [skip] no images downloaded")
             continue
 
         try:
-            data, usage = caption_image(client, image_bytes, row)
+            data, usage = caption_group(client, images, first_row, total_count=len(rows))
             total_in += usage.prompt_tokens
             total_out += usage.completion_tokens
         except Exception as e:
@@ -206,10 +231,9 @@ def main():
         print(f"    caption: {caption}")
         print(f"    tags:    {hashtags}")
 
-        update_row(ws, row_idx, caption, hashtags)
-        print(f"    [OK] status -> ready")
+        update_group(ws, row_indices, caption, hashtags)
+        print(f"    [OK] {len(rows)} row(s) -> ready")
 
-    # gpt-4o pricing: $2.50/1M input, $10/1M output
     in_cost = total_in / 1_000_000 * 2.50
     out_cost = total_out / 1_000_000 * 10.00
     print(f"\n[OK] Tokens: {total_in:,} in + {total_out:,} out")
