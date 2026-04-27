@@ -1,10 +1,7 @@
 ﻿"""
-Ingest: list files in Dropbox /Instagram Automation/raw, append new ones to the Sheet
-as status=pending_metadata. Each ingest run creates a single batch group_id, so all
-new photos in one run end up as one carousel post.
-
-Idempotent on file_path (lowercase). exiftool -> piexif fallback.
-GPS borrowing within batch + reverse geocoding via Nominatim.
+Ingest: list new files in Dropbox /Instagram Automation/raw, group them by
+upload time gaps (>60 min apart = different batch), append each batch as
+its own group_id to the Sheet.
 """
 
 import os
@@ -15,7 +12,7 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
 import dropbox
@@ -31,6 +28,7 @@ load_dotenv()
 DROPBOX_FOLDER = os.getenv("DROPBOX_FOLDER")
 SHEET_ID = os.getenv("SHEET_ID")
 SHEET_TAB = os.getenv("SHEET_TAB")
+BATCH_GAP_MINUTES = int(os.getenv("BATCH_GAP_MINUTES", "60"))
 
 COLUMNS = [
     "file_name", "file_link", "media_type", "caption", "hashtags",
@@ -86,8 +84,27 @@ def list_dropbox_photos(dbx):
     return photos
 
 
-def get_existing_rows(ws):
-    return ws.get_all_records()
+def get_existing_paths(ws):
+    rows = ws.get_all_records()
+    return {(r.get("file_path") or "").strip().lower() for r in rows}
+
+
+def split_into_batches(photos, gap_minutes):
+    """Sort by upload time; split into batches when gap > gap_minutes."""
+    if not photos:
+        return []
+    sorted_photos = sorted(photos, key=lambda p: p.client_modified or p.server_modified)
+    batches = [[sorted_photos[0]]]
+    for photo in sorted_photos[1:]:
+        prev = batches[-1][-1]
+        prev_t = prev.client_modified or prev.server_modified
+        cur_t = photo.client_modified or photo.server_modified
+        gap = (cur_t - prev_t).total_seconds() / 60
+        if gap > gap_minutes:
+            batches.append([photo])
+        else:
+            batches[-1].append(photo)
+    return batches
 
 
 def get_or_create_shared_link(dbx, path):
@@ -214,50 +231,26 @@ def reverse_geocode(lat, lon):
         return ""
 
 
-def main():
-    print("=== Valor Voyages: ingest ===")
-    print(f"exiftool: {EXIFTOOL or 'NOT FOUND - falling back to piexif'}")
-    dbx = get_dropbox_client()
-    ws = get_sheets_worksheet()
-    print(f"Watching: {DROPBOX_FOLDER}")
-    print(f"Sheet:    {ws.spreadsheet.title} / {ws.title}")
-
-    photos = list_dropbox_photos(dbx)
-    print(f"\nDropbox: {len(photos)} image files")
-
-    existing_rows = get_existing_rows(ws)
-    existing_paths = {(r.get("file_path") or "").strip().lower() for r in existing_rows}
-    print(f"Sheet:   {len(existing_paths)} rows tracked")
-
-    new_photos = [p for p in photos if p.path_lower not in existing_paths]
-    print(f"\nNew to ingest: {len(new_photos)}")
-    if not new_photos:
-        return
-
-    # ONE batch ID for this entire ingest run = ONE post
-    batch_id = "batch-" + datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    print(f"Batch ID for this run: {batch_id}")
-
+def process_batch(dbx, ws, batch_photos, batch_id):
+    """Process a single batch: extract EXIF, borrow GPS, geocode, append rows."""
     rows = []
-    for i, photo in enumerate(new_photos, 1):
-        print(f"  [{i}/{len(new_photos)}] {photo.name}")
+    for i, photo in enumerate(batch_photos, 1):
+        print(f"    [{i}/{len(batch_photos)}] {photo.name}")
         link = get_or_create_shared_link(dbx, photo.path_lower)
         if photo.size <= 25 * 1024 * 1024:
             try:
                 _, resp = dbx.files_download(photo.path_lower)
                 date_taken, gps_lat, gps_lon = extract_exif(resp.content)
             except Exception as e:
-                print(f"    [warn] EXIF read failed: {e}")
+                print(f"      [warn] EXIF: {e}")
                 date_taken, gps_lat, gps_lon = "", "", ""
         else:
             date_taken, gps_lat, gps_lon = "", "", ""
 
-        if date_taken:
-            print(f"    date: {date_taken}")
         if gps_lat and gps_lon:
-            print(f"    gps:  {gps_lat}, {gps_lon}")
+            print(f"      gps: {gps_lat}, {gps_lon}")
 
-        row = {
+        rows.append({
             "file_name": photo.name,
             "file_link": link,
             "media_type": "image",
@@ -274,10 +267,9 @@ def main():
             "location_text": "",
             "file_path": photo.path_lower,
             "post_id": "",
-        }
-        rows.append(row)
+        })
 
-    # Borrow GPS within this batch (any row with GPS donates to others lacking it)
+    # Borrow GPS within the batch
     donor_lat = donor_lon = donor_name = ""
     for r in rows:
         if r["gps_lat"] and r["gps_lon"]:
@@ -285,24 +277,52 @@ def main():
             break
     if donor_lat:
         for r in rows:
-            if not r["gps_lat"] and not r["gps_lon"]:
+            if not r["gps_lat"]:
                 r["gps_lat"] = donor_lat
                 r["gps_lon"] = donor_lon
                 r["notes"] = f"gps borrowed from {donor_name}"
-                print(f"    [borrow] {r['file_name']}: GPS from {donor_name}")
 
-    # Reverse geocode the batch (one call, applied to all rows)
-    place = ""
-    if donor_lat:
-        place = reverse_geocode(donor_lat, donor_lon)
-        if place:
-            print(f"    place: {place}")
+    # Geocode once for the batch
+    place = reverse_geocode(donor_lat, donor_lon) if donor_lat else ""
     if place:
+        print(f"      place: {place}")
         for r in rows:
             r["location_text"] = place
 
-    print(f"\nAppending {len(rows)} rows to Sheet (group_id={batch_id})...")
-    values = [[r.get(c, "") for c in COLUMNS] for r in rows]
+    return rows
+
+
+def main():
+    print("=== Valor Voyages: ingest ===")
+    print(f"exiftool: {EXIFTOOL or 'NOT FOUND - falling back to piexif'}")
+    print(f"Batch gap: {BATCH_GAP_MINUTES} min")
+    dbx = get_dropbox_client()
+    ws = get_sheets_worksheet()
+
+    photos = list_dropbox_photos(dbx)
+    print(f"\nDropbox: {len(photos)} image files")
+    existing_paths = get_existing_paths(ws)
+    print(f"Sheet:   {len(existing_paths)} rows tracked")
+
+    new_photos = [p for p in photos if p.path_lower not in existing_paths]
+    print(f"New:     {len(new_photos)} photos")
+    if not new_photos:
+        return
+
+    batches = split_into_batches(new_photos, BATCH_GAP_MINUTES)
+    print(f"Batches: {len(batches)} (split by upload-time gaps > {BATCH_GAP_MINUTES} min)\n")
+
+    all_rows = []
+    for i, batch_photos in enumerate(batches, 1):
+        batch_id = "batch-" + datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        if len(batches) > 1:
+            batch_id += f"-{i}"
+        print(f"  Batch {i}/{len(batches)} (id={batch_id}, {len(batch_photos)} photos):")
+        rows = process_batch(dbx, ws, batch_photos, batch_id)
+        all_rows.extend(rows)
+
+    print(f"\nAppending {len(all_rows)} rows to Sheet...")
+    values = [[r.get(c, "") for c in COLUMNS] for r in all_rows]
     ws.append_rows(values, value_input_option="USER_ENTERED")
     print("[OK] Done.")
 
