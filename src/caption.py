@@ -7,12 +7,20 @@ Archive step is non-fatal: if the move fails, captions are still saved to the
 Sheet so we don't lose work.
 """
 
+import sys
 import os
 import io
 import json
 import base64
 from collections import defaultdict
 from dotenv import load_dotenv
+
+# Force UTF-8 stdout so emojis in captions don't crash the script
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 import dropbox
 from dropbox.exceptions import ApiError
@@ -56,6 +64,7 @@ RULES:
 - Casual voice. Not poetic. Not Travel Channel.
 - "We" first-person plural is the default.
 - 0-2 exclamation points; sparingly.
+- DO NOT include emojis in the caption. Plain text only.
 
 BANNED phrases:
 - "vibes", "soaking in/up", "taking in", "drinking in"
@@ -151,8 +160,7 @@ def caption_group(client, image_bytes_list, context, total_count):
 
 
 def archive_group(dbx, group_id, rows, caption, hashtags):
-    """Move all photos in the group to /processed/<group_id>/ and write caption.txt.
-    Raises on failure; caller must catch."""
+    """Move all photos in the group to /processed/<group_id>/ and write caption.txt."""
     dest_folder = f"{PROCESSED_ROOT}/{group_id}"
     try:
         dbx.files_create_folder_v2(dest_folder)
@@ -164,6 +172,10 @@ def archive_group(dbx, group_id, rows, caption, hashtags):
     for row_idx, row in rows:
         old_path = row.get("file_path", "")
         if not old_path:
+            continue
+        # If the file is already in the destination folder, skip moving
+        if old_path.lower().startswith(dest_folder.lower() + "/"):
+            new_paths[row_idx] = old_path
             continue
         file_name = old_path.rsplit("/", 1)[-1]
         new_path = f"{dest_folder}/{file_name}"
@@ -238,14 +250,12 @@ def main():
         print(f"    caption: {caption}")
         print(f"    tags:    {hashtags}")
 
-        # Archive is non-fatal: if it fails, we still save the caption to Sheet
         new_paths = {}
         try:
             new_paths = archive_group(dbx, gid, rows, caption, hashtags)
         except Exception as e:
             print(f"    [warn] archive failed (caption still saved): {e}")
 
-        # Always update Sheet — don't lose captions even if archiving broke
         try:
             update_group_in_sheet(ws, rows, caption, hashtags, new_paths)
             print(f"    [OK] {len(rows)} row(s) -> ready")
