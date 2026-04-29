@@ -1,7 +1,7 @@
 ﻿"""
 Caption: pull rows where status=pending_metadata, group by group_id, generate
-ONE caption per group via OpenAI vision, apply to all rows, then crop each
-photo to IG-friendly aspect ratio and archive to /processed/<group_id>/.
+ONE caption per group via OpenAI vision, apply to all rows, then crop+resize
+each photo to IG-friendly specs and archive to /processed/<group_id>/.
 
 Originals are preserved in /processed/<group_id>/originals/.
 """
@@ -35,8 +35,8 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
 RAW_FOLDER = os.getenv("DROPBOX_FOLDER", "/Instagram Automation/raw")
 PROCESSED_ROOT = RAW_FOLDER.rsplit("/", 1)[0] + "/processed"
 
-# Aspect ratio for IG. Format: "W:H". Common: "4:5" (portrait), "1:1" (square), "1.91:1" (landscape)
 IG_CROP_RATIO = os.getenv("IG_CROP_RATIO", "4:5")
+IG_MAX_LONG_EDGE = int(os.getenv("IG_MAX_LONG_EDGE", "1350"))
 
 SYSTEM_PROMPT = """You are writing one Instagram caption for Valor Voyages, a full-time RV family traveling the US.
 
@@ -89,43 +89,40 @@ Respond ONLY with JSON: {"caption": "...", "hashtags": "#tag1 #tag2"}
 
 
 def parse_ratio(s):
-    """Parse '4:5' -> 0.8 (width/height)."""
     try:
         w, h = s.split(":")
         return float(w) / float(h)
     except Exception:
-        return 4.0 / 5.0  # default
+        return 4.0 / 5.0
 
 
-def crop_to_ratio(image_bytes, target_ratio):
-    """Center-crop image to target aspect ratio (width/height). Preserves EXIF."""
+def crop_to_ratio(image_bytes, target_ratio, max_long_edge=1350):
+    """Center-crop to target aspect ratio, then resize so long edge <= max_long_edge."""
     img = Image.open(io.BytesIO(image_bytes))
-    img = ImageOps.exif_transpose(img)  # respect EXIF orientation
+    img = ImageOps.exif_transpose(img)
     w, h = img.size
     current = w / h
 
-    if abs(current - target_ratio) < 0.01:
-        # Already at target ratio - just re-save
-        out = io.BytesIO()
-        img.save(out, format="JPEG", quality=92, optimize=True,
-                 exif=img.info.get("exif", b""))
-        return out.getvalue()
+    # 1. Crop if not already at target ratio
+    if abs(current - target_ratio) >= 0.01:
+        if current > target_ratio:
+            new_w = int(h * target_ratio)
+            left = (w - new_w) // 2
+            img = img.crop((left, 0, left + new_w, h))
+        else:
+            new_h = int(w / target_ratio)
+            top = (h - new_h) // 2
+            img = img.crop((0, top, w, top + new_h))
 
-    if current > target_ratio:
-        # Too wide - crop sides
-        new_w = int(h * target_ratio)
-        left = (w - new_w) // 2
-        cropped = img.crop((left, 0, left + new_w, h))
-    else:
-        # Too tall - crop top/bottom
-        new_h = int(w / target_ratio)
-        top = (h - new_h) // 2
-        cropped = img.crop((0, top, w, top + new_h))
+    # 2. Resize so long edge <= max_long_edge (preserves aspect ratio)
+    if max(img.size) > max_long_edge:
+        img.thumbnail((max_long_edge, max_long_edge), Image.LANCZOS)
 
-    if cropped.mode != "RGB":
-        cropped = cropped.convert("RGB")
+    # 3. Save as JPEG
+    if img.mode != "RGB":
+        img = img.convert("RGB")
     out = io.BytesIO()
-    cropped.save(out, format="JPEG", quality=92, optimize=True)
+    img.save(out, format="JPEG", quality=92, optimize=True)
     return out.getvalue()
 
 
@@ -203,12 +200,6 @@ def caption_group(client, image_bytes_list, context, total_count):
 
 
 def archive_group(dbx, group_id, rows, caption, hashtags):
-    """For each photo in the group:
-    - Download from /raw
-    - Crop to IG_CROP_RATIO and upload cropped to /processed/<group_id>/<filename>
-    - Move original to /processed/<group_id>/originals/<filename>
-    Also writes /processed/<group_id>/caption.txt.
-    """
     target_ratio = parse_ratio(IG_CROP_RATIO)
     dest_folder = f"{PROCESSED_ROOT}/{group_id}"
     originals_folder = f"{dest_folder}/originals"
@@ -225,7 +216,6 @@ def archive_group(dbx, group_id, rows, caption, hashtags):
         old_path = row.get("file_path", "")
         if not old_path:
             continue
-        # Skip if already archived
         if old_path.lower().startswith(dest_folder.lower() + "/"):
             new_paths[row_idx] = old_path
             continue
@@ -234,30 +224,19 @@ def archive_group(dbx, group_id, rows, caption, hashtags):
         original_path = f"{originals_folder}/{file_name}"
 
         try:
-            # 1. Download original
             _, resp = dbx.files_download(old_path)
             original_bytes = resp.content
-
-            # 2. Crop to IG ratio
-            cropped_bytes = crop_to_ratio(original_bytes, target_ratio)
-
-            # 3. Upload cropped to /processed/<batch>/<file>
+            cropped_bytes = crop_to_ratio(original_bytes, target_ratio, IG_MAX_LONG_EDGE)
             dbx.files_upload(
-                cropped_bytes,
-                cropped_path,
-                mode=dropbox.files.WriteMode.overwrite,
-                autorename=False,
+                cropped_bytes, cropped_path,
+                mode=dropbox.files.WriteMode.overwrite, autorename=False,
             )
-
-            # 4. Move original to /processed/<batch>/originals/<file>
             dbx.files_move_v2(old_path, original_path, autorename=True)
-
             new_paths[row_idx] = cropped_path.lower()
-            print(f"    [crop+archive] {file_name}  ({IG_CROP_RATIO})")
+            print(f"    [crop+archive] {file_name}  ({IG_CROP_RATIO}, max {IG_MAX_LONG_EDGE}px)")
         except Exception as e:
             print(f"    [warn] crop/archive failed for {file_name}: {e}")
 
-    # caption.txt
     caption_text = f"{caption}\n\n{hashtags}\n"
     try:
         dbx.files_upload(
@@ -286,7 +265,7 @@ def main():
     ws = get_sheets_worksheet()
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     print(f"Model: {OPENAI_MODEL}")
-    print(f"Crop ratio: {IG_CROP_RATIO}")
+    print(f"Crop: {IG_CROP_RATIO} @ max {IG_MAX_LONG_EDGE}px long edge")
 
     groups = fetch_pending_grouped(ws)
     total_rows = sum(len(rows) for rows in groups.values())
