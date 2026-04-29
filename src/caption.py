@@ -3,6 +3,9 @@ Caption: pull rows where status=pending_metadata, group by group_id, generate
 ONE caption per group via OpenAI vision, apply to all rows, then crop+resize
 each photo to IG-friendly specs and archive to /processed/<group_id>/.
 
+Smart crop: only crops if image is OUTSIDE Instagram's accepted aspect ratio
+range (0.8 to 1.91). Always resizes to fit IG/Buffer size limits.
+
 Originals are preserved in /processed/<group_id>/originals/.
 """
 
@@ -35,8 +38,11 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
 RAW_FOLDER = os.getenv("DROPBOX_FOLDER", "/Instagram Automation/raw")
 PROCESSED_ROOT = RAW_FOLDER.rsplit("/", 1)[0] + "/processed"
 
-IG_CROP_RATIO = os.getenv("IG_CROP_RATIO", "4:5")
 IG_MAX_LONG_EDGE = int(os.getenv("IG_MAX_LONG_EDGE", "1350"))
+
+# Instagram-accepted aspect ratio range
+IG_RATIO_MIN = 0.8   # 4:5 portrait (most vertical IG accepts)
+IG_RATIO_MAX = 1.91  # 1.91:1 landscape (most horizontal IG accepts)
 
 SYSTEM_PROMPT = """You are writing one Instagram caption for Valor Voyages, a full-time RV family traveling the US.
 
@@ -88,42 +94,40 @@ Respond ONLY with JSON: {"caption": "...", "hashtags": "#tag1 #tag2"}
 """
 
 
-def parse_ratio(s):
-    try:
-        w, h = s.split(":")
-        return float(w) / float(h)
-    except Exception:
-        return 4.0 / 5.0
-
-
-def crop_to_ratio(image_bytes, target_ratio, max_long_edge=1350):
-    """Center-crop to target aspect ratio, then resize so long edge <= max_long_edge."""
+def smart_crop_and_resize(image_bytes, max_long_edge=1350):
+    """If image is outside IG's accepted aspect ratio (0.8-1.91), crop to nearest edge.
+    Otherwise leave aspect ratio alone. Always resize so long edge <= max_long_edge."""
     img = Image.open(io.BytesIO(image_bytes))
     img = ImageOps.exif_transpose(img)
     w, h = img.size
     current = w / h
+    cropped = False
 
-    # 1. Crop if not already at target ratio
-    if abs(current - target_ratio) >= 0.01:
-        if current > target_ratio:
-            new_w = int(h * target_ratio)
-            left = (w - new_w) // 2
-            img = img.crop((left, 0, left + new_w, h))
-        else:
-            new_h = int(w / target_ratio)
-            top = (h - new_h) // 2
-            img = img.crop((0, top, w, top + new_h))
+    if current < IG_RATIO_MIN:
+        # Too tall - crop top/bottom to reach 4:5 (0.8)
+        new_h = int(w / IG_RATIO_MIN)
+        top = (h - new_h) // 2
+        img = img.crop((0, top, w, top + new_h))
+        cropped = True
+    elif current > IG_RATIO_MAX:
+        # Too wide - crop sides to reach 1.91:1
+        new_w = int(h * IG_RATIO_MAX)
+        left = (w - new_w) // 2
+        img = img.crop((left, 0, left + new_w, h))
+        cropped = True
+    # else: aspect ratio already IG-compatible, leave alone
 
-    # 2. Resize so long edge <= max_long_edge (preserves aspect ratio)
+    # Resize to fit IG/Buffer specs
+    resized = False
     if max(img.size) > max_long_edge:
         img.thumbnail((max_long_edge, max_long_edge), Image.LANCZOS)
+        resized = True
 
-    # 3. Save as JPEG
     if img.mode != "RGB":
         img = img.convert("RGB")
     out = io.BytesIO()
     img.save(out, format="JPEG", quality=92, optimize=True)
-    return out.getvalue()
+    return out.getvalue(), cropped, resized
 
 
 def get_dropbox_client():
@@ -200,7 +204,6 @@ def caption_group(client, image_bytes_list, context, total_count):
 
 
 def archive_group(dbx, group_id, rows, caption, hashtags):
-    target_ratio = parse_ratio(IG_CROP_RATIO)
     dest_folder = f"{PROCESSED_ROOT}/{group_id}"
     originals_folder = f"{dest_folder}/originals"
 
@@ -226,16 +229,25 @@ def archive_group(dbx, group_id, rows, caption, hashtags):
         try:
             _, resp = dbx.files_download(old_path)
             original_bytes = resp.content
-            cropped_bytes = crop_to_ratio(original_bytes, target_ratio, IG_MAX_LONG_EDGE)
+            processed_bytes, cropped, resized = smart_crop_and_resize(
+                original_bytes, IG_MAX_LONG_EDGE
+            )
             dbx.files_upload(
-                cropped_bytes, cropped_path,
+                processed_bytes, cropped_path,
                 mode=dropbox.files.WriteMode.overwrite, autorename=False,
             )
             dbx.files_move_v2(old_path, original_path, autorename=True)
             new_paths[row_idx] = cropped_path.lower()
-            print(f"    [crop+archive] {file_name}  ({IG_CROP_RATIO}, max {IG_MAX_LONG_EDGE}px)")
+            actions = []
+            if cropped:
+                actions.append("cropped")
+            if resized:
+                actions.append("resized")
+            if not actions:
+                actions.append("re-saved")
+            print(f"    [archive] {file_name}  ({', '.join(actions)})")
         except Exception as e:
-            print(f"    [warn] crop/archive failed for {file_name}: {e}")
+            print(f"    [warn] archive failed for {file_name}: {e}")
 
     caption_text = f"{caption}\n\n{hashtags}\n"
     try:
@@ -265,7 +277,7 @@ def main():
     ws = get_sheets_worksheet()
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     print(f"Model: {OPENAI_MODEL}")
-    print(f"Crop: {IG_CROP_RATIO} @ max {IG_MAX_LONG_EDGE}px long edge")
+    print(f"IG range: {IG_RATIO_MIN}-{IG_RATIO_MAX}, max edge: {IG_MAX_LONG_EDGE}px")
 
     groups = fetch_pending_grouped(ws)
     total_rows = sum(len(rows) for rows in groups.values())
