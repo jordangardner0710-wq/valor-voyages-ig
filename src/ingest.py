@@ -28,7 +28,7 @@ load_dotenv()
 DROPBOX_FOLDER = os.getenv("DROPBOX_FOLDER")
 SHEET_ID = os.getenv("SHEET_ID")
 SHEET_TAB = os.getenv("SHEET_TAB")
-BATCH_GAP_MINUTES = int(os.getenv("BATCH_GAP_MINUTES", "60"))
+BATCH_GAP_MINUTES = int(os.getenv("BATCH_GAP_MINUTES", "15"))
 
 COLUMNS = [
     "file_name", "file_link", "media_type", "caption", "hashtags",
@@ -330,3 +330,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
