@@ -1,8 +1,6 @@
 ﻿name: Caption (AI captions)
 
 on:
-  schedule:
-    - cron: "5,35 * * * *"
   workflow_dispatch:
 
 concurrency:
