@@ -1,7 +1,7 @@
 ﻿"""
 Ingest: list new files in Dropbox /Instagram Automation/raw, group them by
-upload time gaps (>60 min apart = different batch), append each batch as
-its own group_id to the Sheet.
+DROPBOX UPLOAD TIME gaps (>60 min apart = different batch), append each batch
+as its own group_id to the Sheet.
 """
 
 import os
@@ -89,17 +89,20 @@ def get_existing_paths(ws):
     return {(r.get("file_path") or "").strip().lower() for r in rows}
 
 
+def upload_time(photo):
+    """When the file appeared in Dropbox (server timestamp)."""
+    return photo.server_modified or photo.client_modified
+
+
 def split_into_batches(photos, gap_minutes):
-    """Sort by upload time; split into batches when gap > gap_minutes."""
+    """Sort by Dropbox upload time; split into batches when gap > gap_minutes."""
     if not photos:
         return []
-    sorted_photos = sorted(photos, key=lambda p: p.client_modified or p.server_modified)
+    sorted_photos = sorted(photos, key=upload_time)
     batches = [[sorted_photos[0]]]
     for photo in sorted_photos[1:]:
         prev = batches[-1][-1]
-        prev_t = prev.client_modified or prev.server_modified
-        cur_t = photo.client_modified or photo.server_modified
-        gap = (cur_t - prev_t).total_seconds() / 60
+        gap = (upload_time(photo) - upload_time(prev)).total_seconds() / 60
         if gap > gap_minutes:
             batches.append([photo])
         else:
@@ -232,7 +235,6 @@ def reverse_geocode(lat, lon):
 
 
 def process_batch(dbx, ws, batch_photos, batch_id):
-    """Process a single batch: extract EXIF, borrow GPS, geocode, append rows."""
     rows = []
     for i, photo in enumerate(batch_photos, 1):
         print(f"    [{i}/{len(batch_photos)}] {photo.name}")
@@ -269,7 +271,6 @@ def process_batch(dbx, ws, batch_photos, batch_id):
             "post_id": "",
         })
 
-    # Borrow GPS within the batch
     donor_lat = donor_lon = donor_name = ""
     for r in rows:
         if r["gps_lat"] and r["gps_lon"]:
@@ -282,7 +283,6 @@ def process_batch(dbx, ws, batch_photos, batch_id):
                 r["gps_lon"] = donor_lon
                 r["notes"] = f"gps borrowed from {donor_name}"
 
-    # Geocode once for the batch
     place = reverse_geocode(donor_lat, donor_lon) if donor_lat else ""
     if place:
         print(f"      place: {place}")
@@ -295,7 +295,7 @@ def process_batch(dbx, ws, batch_photos, batch_id):
 def main():
     print("=== Valor Voyages: ingest ===")
     print(f"exiftool: {EXIFTOOL or 'NOT FOUND - falling back to piexif'}")
-    print(f"Batch gap: {BATCH_GAP_MINUTES} min")
+    print(f"Batch gap: {BATCH_GAP_MINUTES} min (by Dropbox upload time)")
     dbx = get_dropbox_client()
     ws = get_sheets_worksheet()
 
@@ -317,7 +317,8 @@ def main():
         batch_id = "batch-" + datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
         if len(batches) > 1:
             batch_id += f"-{i}"
-        print(f"  Batch {i}/{len(batches)} (id={batch_id}, {len(batch_photos)} photos):")
+        first_t = upload_time(batch_photos[0]).strftime("%Y-%m-%d %H:%M:%S UTC")
+        print(f"  Batch {i}/{len(batches)} (id={batch_id}, {len(batch_photos)} photos, first uploaded {first_t}):")
         rows = process_batch(dbx, ws, batch_photos, batch_id)
         all_rows.extend(rows)
 
